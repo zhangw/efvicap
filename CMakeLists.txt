@@ -6,6 +6,11 @@ set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if(NOT CMAKE_BUILD_TYPE)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
+endif()
+set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
+
 project(efvicap VERSION "1.1.0" LANGUAGES CXX)
 
 include(FindPackageHandleStandardArgs)
@@ -29,6 +34,7 @@ target_include_directories(efvicap
         ${EFVI_INCLUDE_DIR})
 target_link_libraries(efvicap
         ${PCAP_LIBRARY}
-        ${EFVI_LIBRARY})
+        ${EFVI_LIBRARY}
+        pthread)
 
 install(TARGETS efvicap RUNTIME DESTINATION bin)

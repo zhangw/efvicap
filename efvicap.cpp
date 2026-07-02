@@ -20,6 +20,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
  */
 
+#include <etherfabric/efct_vi.h>
 #include <etherfabric/memreg.h>
 #include <etherfabric/pd.h>
 #include <etherfabric/vi.h>
@@ -34,11 +35,14 @@ SOFTWARE.
 #include <array>
 #include <atomic>
 #include <csignal>
+#include <cstdint>
 #include <cstring>
 #include <iostream>
 #include <pcap.h>
 #include <sys/mman.h>
 #include <system_error>
+#include <thread>
+#include <time.h>
 #include <unistd.h>
 #include <vector>
 
@@ -48,10 +52,81 @@ constexpr size_t pktBufSize = 2048;
 // Should be multiple of 8 according to Solarflare documentation
 constexpr int refillBatchSize = 16;
 
+constexpr size_t pcapRingCapacity = 8192;
+static_assert((pcapRingCapacity & (pcapRingCapacity - 1)) == 0,
+              "pcapRingCapacity must be a power of two");
+
 // Huge page size for your platform
 #if defined(__x86_64__) || defined(__i386__)
 constexpr size_t hugePageSize = 2 * 1024 * 1024;
 #endif
+
+struct PcapSlot {
+  uint32_t caplen;
+  struct timeval ts;
+  uint8_t data[pktBufSize];
+};
+
+class SpscRing {
+public:
+  bool try_push(const PcapSlot &slot) {
+    const uint32_t tail = tail_.load(std::memory_order_relaxed);
+    const uint32_t next = (tail + 1) & (pcapRingCapacity - 1);
+    if (next == head_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    slots_[tail] = slot;
+    tail_.store(next, std::memory_order_release);
+    return true;
+  }
+
+  bool try_pop(PcapSlot &slot) {
+    const uint32_t head = head_.load(std::memory_order_relaxed);
+    if (head == tail_.load(std::memory_order_acquire)) {
+      return false;
+    }
+    slot = slots_[head];
+    head_.store((head + 1) & (pcapRingCapacity - 1), std::memory_order_release);
+    return true;
+  }
+
+  bool empty() const {
+    return head_.load(std::memory_order_acquire) ==
+           tail_.load(std::memory_order_acquire);
+  }
+
+private:
+  std::array<PcapSlot, pcapRingCapacity> slots_{};
+  alignas(64) std::atomic<uint32_t> head_{0};
+  alignas(64) std::atomic<uint32_t> tail_{0};
+};
+
+struct WriterContext {
+  SpscRing *ring;
+  pcap_dumper_t *dumper;
+  std::atomic<bool> *running;
+};
+
+struct PktBuf {
+  int id;
+  ef_addr efAddr;
+  PktBuf *next;
+};
+
+struct Resources {
+  ef_driver_handle dh;
+  struct ef_pd pd;
+  struct ef_vi vi;
+  int rxPrefixLen;
+  void *pktBufs;
+  int nPktBufs;
+  struct ef_memreg memreg;
+  std::vector<PktBuf> pktBufPool;
+  PktBuf *freePktBufs;
+  int freePktBufsN;
+  int refillLevel;
+  int refillMin;
+};
 
 static std::ostream &operator<<(std::ostream &os, const in_addr addr) {
   std::array<char, INET_ADDRSTRLEN> str = {};
@@ -86,6 +161,135 @@ static void printPacket(const void *buf, int /*len*/) {
     std::cout << "arp" << std::endl;
   } else {
     std::cout << ntohs(eth->ether_type) << std::endl;
+  }
+}
+
+static void pktBufFree(Resources &res, PktBuf *pktBuf) {
+  pktBuf->next = res.freePktBufs;
+  res.freePktBufs = pktBuf;
+  ++res.freePktBufsN;
+}
+
+static PktBuf *pktBufFromId(Resources &res, int id) {
+  return &res.pktBufPool[static_cast<size_t>(id)];
+}
+
+static bool refillRxRing(Resources &res) {
+  if (ef_vi_receive_fill_level(&res.vi) > res.refillLevel ||
+      res.freePktBufsN < refillBatchSize) {
+    return false;
+  }
+
+  do {
+    for (int i = 0; i < refillBatchSize; ++i) {
+      PktBuf *pktBuf = res.freePktBufs;
+      res.freePktBufs = pktBuf->next;
+      --res.freePktBufsN;
+      ef_vi_receive_init(&res.vi, pktBuf->efAddr, pktBuf->id);
+    }
+  } while (ef_vi_receive_fill_level(&res.vi) < res.refillMin &&
+           res.freePktBufsN >= refillBatchSize);
+  ef_vi_receive_push(&res.vi);
+  return true;
+}
+
+static struct timeval timespecToTimeval(const timespec &ts) {
+  struct timeval tv = {};
+  tv.tv_sec = ts.tv_sec;
+  tv.tv_usec = static_cast<suseconds_t>(ts.tv_nsec / 1000);
+  return tv;
+}
+
+static struct timeval hwTimestampToTimeval(const timespec &ts) {
+  struct timeval tv = {};
+  tv.tv_sec = ts.tv_sec;
+  tv.tv_usec = static_cast<suseconds_t>(ts.tv_nsec);
+  return tv;
+}
+
+struct CaptureOutput {
+  bool hwTimestamps;
+  bool useWriter;
+  pcap_dumper_t *pcapDumper;
+  SpscRing *ring;
+  std::atomic<uint64_t> *droppedEnqueue;
+};
+
+static void deliverPacket(const char *buf, int bufLen, const void *hwPkt,
+                          Resources &res, CaptureOutput &out,
+                          const timespec *batchTs) {
+  if (out.useWriter) {
+    PcapSlot slot = {};
+    slot.caplen = static_cast<uint32_t>(bufLen);
+    if (out.hwTimestamps) {
+      timespec ts = {};
+      unsigned flags = 0;
+      if (ef_vi_receive_get_timestamp_with_sync_flags(
+              &res.vi, hwPkt, &ts, &flags)) {
+        throw std::runtime_error("failed to get hw timestamp");
+      }
+      slot.ts = hwTimestampToTimeval(ts);
+    } else {
+      slot.ts = timespecToTimeval(*batchTs);
+    }
+    std::memcpy(slot.data, buf, static_cast<size_t>(bufLen));
+    if (!out.ring->try_push(slot)) {
+      ++(*out.droppedEnqueue);
+    }
+    return;
+  }
+
+  if (out.pcapDumper) {
+    pcap_pkthdr pktHdr = {};
+    pktHdr.caplen = static_cast<bpf_u_int32>(bufLen);
+    pktHdr.len = static_cast<bpf_u_int32>(bufLen);
+    if (out.hwTimestamps) {
+      timespec ts = {};
+      unsigned flags = 0;
+      if (ef_vi_receive_get_timestamp_with_sync_flags(
+              &res.vi, hwPkt, &ts, &flags)) {
+        throw std::runtime_error("failed to get hw timestamp");
+      }
+      pktHdr.ts = hwTimestampToTimeval(ts);
+    } else {
+      pktHdr.ts = timespecToTimeval(*batchTs);
+    }
+    pcap_dump(reinterpret_cast<u_char *>(out.pcapDumper), &pktHdr,
+              reinterpret_cast<const u_char *>(buf));
+  } else {
+    printPacket(buf, bufLen);
+  }
+}
+
+static void handleRx(Resources &res, int pktBufId, int len, const void *hwPkt,
+                     CaptureOutput &out, const timespec *batchTs) {
+  pktBufFree(res, pktBufFromId(res, pktBufId));
+  const char *buf = static_cast<const char *>(res.pktBufs) +
+                      pktBufSize * pktBufId + res.rxPrefixLen;
+  deliverPacket(buf, len, hwPkt, res, out, batchTs);
+}
+
+static void handleRxRef(Resources &res, unsigned pktId, int len,
+                        CaptureOutput &out, const timespec *batchTs) {
+  const void *pkt = efct_vi_rxpkt_get(&res.vi, pktId);
+  const char *buf = static_cast<const char *>(pkt) + res.rxPrefixLen;
+  const int bufLen = len - res.rxPrefixLen;
+  deliverPacket(buf, bufLen, pkt, res, out, batchTs);
+  efct_vi_rxpkt_release(&res.vi, pktId);
+}
+
+static void writerThread(WriterContext *ctx) {
+  PcapSlot slot;
+  while (ctx->running->load(std::memory_order_acquire) || !ctx->ring->empty()) {
+    if (ctx->ring->try_pop(slot)) {
+      pcap_pkthdr pktHdr = {};
+      pktHdr.ts = slot.ts;
+      pktHdr.caplen = slot.caplen;
+      pktHdr.len = slot.caplen;
+      pcap_dump(reinterpret_cast<u_char *>(ctx->dumper), &pktHdr, slot.data);
+    } else {
+      std::this_thread::yield();
+    }
   }
 }
 
@@ -140,27 +344,14 @@ int main(int argc, char *argv[]) {
       filter.port = htons(atoi(sep + 1));
     }
     if (inet_aton(argv[i], &filter.addr) == 0) {
-      std::runtime_error("invalid address");
+      throw std::runtime_error("invalid address");
     }
     filters.push_back(filter);
   }
 
   std::signal(SIGINT, signalHandler);
 
-  struct {
-    // Resource handles
-    ef_driver_handle dh;
-    struct ef_pd pd;
-    struct ef_vi vi;
-    int rxPrefixLen;
-
-    // DMA memory
-    void *pktBufs;
-    int nPktBufs;
-    struct ef_memreg memreg;
-    std::vector<int> freePktBufs;
-    std::vector<ef_addr> pktBufAddrs;
-  } res = {};
+  Resources res = {};
 
   if (ef_driver_open(&res.dh) < 0) {
     throw std::system_error(errno, std::generic_category(), "ef_driver_open");
@@ -170,53 +361,52 @@ int main(int argc, char *argv[]) {
     throw std::system_error(errno, std::generic_category(),
                             "ef_pd_alloc_by_name");
   }
+
   unsigned vi_flags = EF_VI_FLAGS_DEFAULT;
   if (hw_timestamps) {
     vi_flags |= EF_VI_RX_TIMESTAMPS;
   }
   if (ef_vi_alloc_from_pd(&res.vi, res.dh, &res.pd, res.dh, -1, -1, 0, NULL, -1,
-                          (enum ef_vi_flags) vi_flags) < 0) {
+                          static_cast<enum ef_vi_flags>(vi_flags)) < 0) {
     throw std::system_error(errno, std::generic_category(),
                             "ef_vi_alloc_from_pd");
   }
 
-  // Length of prefix before actual packet data
   res.rxPrefixLen = ef_vi_receive_prefix_len(&res.vi);
 
-  // Allocate memory for DMA transfers. Try to get huge pages.
   res.nPktBufs = ef_vi_receive_capacity(&res.vi);
-  const size_t bytesNeeded = res.nPktBufs * pktBufSize;
-  // Round up to nearest huge page size
+  const size_t bytesNeeded = static_cast<size_t>(res.nPktBufs) * pktBufSize;
   const size_t bytesRounded = (bytesNeeded / hugePageSize + 1) * hugePageSize;
   res.pktBufs = mmap(NULL, bytesRounded, PROT_READ | PROT_WRITE,
                      MAP_ANONYMOUS | MAP_PRIVATE | MAP_HUGETLB, -1, 0);
   if (res.pktBufs == MAP_FAILED) {
     std::cerr << "warning: failed to allocate hugepages for DMA buffers"
               << std::endl;
-    posix_memalign(&res.pktBufs, 4096, bytesRounded);
+    if (posix_memalign(&res.pktBufs, 4096, bytesRounded) != 0) {
+      throw std::bad_alloc();
+    }
   }
 
-  // Register the memory for use with DMA
   if (ef_memreg_alloc(&res.memreg, res.dh, &res.pd, res.dh, res.pktBufs,
                       bytesRounded) < 0) {
     throw std::system_error(errno, std::generic_category(), "ef_memreg_alloc");
   }
-  // Store the DMA address for each packet buffer
+
+  res.pktBufPool.resize(static_cast<size_t>(res.nPktBufs));
   for (int i = 0; i < res.nPktBufs; ++i) {
-    res.pktBufAddrs.push_back(ef_memreg_dma_addr(&res.memreg, i * pktBufSize));
-    res.freePktBufs.push_back(i);
+    PktBuf &pktBuf = res.pktBufPool[static_cast<size_t>(i)];
+    pktBuf.id = i;
+    pktBuf.efAddr = ef_memreg_dma_addr(&res.memreg, i * pktBufSize);
+    pktBufFree(res, &pktBuf);
   }
 
-  // Fill the RX descriptor ring
-  while (ef_vi_receive_space(&res.vi) > 0 && !res.freePktBufs.empty()) {
-    const int pktBufId = res.freePktBufs.back();
-    res.freePktBufs.resize(res.freePktBufs.size() - 1);
-    ef_vi_receive_init(&res.vi, res.pktBufAddrs[pktBufId], pktBufId);
+  res.refillLevel = res.nPktBufs - refillBatchSize;
+  res.refillMin = res.nPktBufs / 2;
+  while (ef_vi_receive_fill_level(&res.vi) <= res.refillLevel) {
+    refillRxRing(res);
   }
-  ef_vi_receive_push(&res.vi);
 
   for (auto filter : filters) {
-    // Match multicast
     ef_filter_spec filter_spec;
     ef_filter_spec_init(&filter_spec, EF_FILTER_FLAG_NONE);
     if (filter.port == 0) {
@@ -229,13 +419,13 @@ int main(int argc, char *argv[]) {
       if (ef_filter_spec_set_eth_local(&filter_spec, EF_FILTER_VLAN_ID_ANY,
                                        mac) < 0) {
         throw std::system_error(errno, std::generic_category(),
-                                "ef_filter_spec_set_port_sniff");
+                                "ef_filter_spec_set_eth_local");
       }
     } else {
       if (ef_filter_spec_set_ip4_local(&filter_spec, IPPROTO_UDP,
                                        filter.addr.s_addr, filter.port) < 0) {
         throw std::system_error(errno, std::generic_category(),
-                                "ef_filter_spec_set_port_sniff");
+                                "ef_filter_spec_set_ip4_local");
       }
     }
     if (ef_vi_filter_add(&res.vi, res.dh, &filter_spec, NULL) < 0) {
@@ -244,7 +434,6 @@ int main(int argc, char *argv[]) {
     }
   }
   if (filters.empty()) {
-    // Match all packets that also match another filter
     ef_filter_spec filter_spec;
     ef_filter_spec_init(&filter_spec, EF_FILTER_FLAG_NONE);
     if (ef_filter_spec_set_port_sniff(&filter_spec, 1) < 0) {
@@ -269,10 +458,15 @@ int main(int argc, char *argv[]) {
     }
   }
 
-  // Open pcap output
   pcap_t *pcap = nullptr;
   pcap_dumper_t *pcapDumper = nullptr;
-  if (!filename.empty()) {
+  SpscRing pcapRing;
+  std::thread writer;
+  WriterContext writerCtx = {};
+  std::atomic<uint64_t> droppedEnqueue = {0};
+  const bool useWriter = !filename.empty();
+
+  if (useWriter) {
     int link_type = DLT_EN10MB;
     int snap_len = 65535;
     u_int precision = PCAP_TSTAMP_PRECISION_MICRO;
@@ -285,67 +479,72 @@ int main(int argc, char *argv[]) {
       throw std::runtime_error("pcap_dump_open: " +
                                std::string(pcap_geterr(pcap)));
     }
+    writerCtx.ring = &pcapRing;
+    writerCtx.dumper = pcapDumper;
+    writerCtx.running = &active;
+    writer = std::thread(writerThread, &writerCtx);
   }
+
+  CaptureOutput out = {};
+  out.hwTimestamps = hw_timestamps;
+  out.useWriter = useWriter;
+  out.pcapDumper = pcapDumper;
+  out.ring = &pcapRing;
+  out.droppedEnqueue = &droppedEnqueue;
 
   std::array<ef_event, 32> evs = {};
   while (active.load(std::memory_order_acquire)) {
+    refillRxRing(res);
     const int nev = ef_eventq_poll(&res.vi, evs.data(), evs.size());
     if (nev > 0) {
+      timespec batchTs = {};
+      if (!hw_timestamps) {
+        clock_gettime(CLOCK_REALTIME_COARSE, &batchTs);
+      }
       for (int i = 0; i < nev; ++i) {
         switch (EF_EVENT_TYPE(evs[i])) {
         case EF_EVENT_TYPE_RX: {
-          res.freePktBufs.push_back(EF_EVENT_RX_RQ_ID(evs[i]));
           if (EF_EVENT_RX_SOP(evs[i]) == 0 || EF_EVENT_RX_CONT(evs[i]) != 0) {
-            // Ignore jumbo packets
+            pktBufFree(res, pktBufFromId(res, EF_EVENT_RX_RQ_ID(evs[i])));
             break;
           }
-          const char *buf = (const char *)res.pktBufs +
-                            pktBufSize * EF_EVENT_RX_RQ_ID(evs[i]) +
-                            res.rxPrefixLen;
-          const int bufLen = EF_EVENT_RX_BYTES(evs[i]) - res.rxPrefixLen;
-          if (pcapDumper) {
-            pcap_pkthdr pktHdr = {};
-            pktHdr.caplen = bufLen;
-            pktHdr.len = bufLen;
-	    if (hw_timestamps) {
-	      timespec ts;
-	      unsigned flags;
-	      const void *pkt = (const char *) res.pktBufs + pktBufSize * EF_EVENT_RX_RQ_ID(evs[i]);
-	      if (ef_vi_receive_get_timestamp_with_sync_flags(&res.vi, pkt, &ts, &flags)) {
-                throw std::runtime_error("failed to get hw timestamp");
-	      }
-	      pktHdr.ts.tv_sec = ts.tv_sec;
-	      pktHdr.ts.tv_usec = ts.tv_nsec; // magic number should be set for nanos
-	    } else {
-              gettimeofday(&pktHdr.ts, nullptr);
-	    }
-            pcap_dump(reinterpret_cast<u_char *>(pcapDumper), &pktHdr,
-                      reinterpret_cast<const u_char *>(buf));
-          } else {
-            printPacket(buf, bufLen);
-          }
+          const int pktBufId = EF_EVENT_RX_RQ_ID(evs[i]);
+          const int len = EF_EVENT_RX_BYTES(evs[i]) - res.rxPrefixLen;
+          const void *hwPkt =
+              static_cast<const char *>(res.pktBufs) + pktBufSize * pktBufId;
+          handleRx(res, pktBufId, len, hwPkt, out, &batchTs);
           break;
         }
+        case EF_EVENT_TYPE_RX_DISCARD: {
+          pktBufFree(res, pktBufFromId(res, EF_EVENT_RX_DISCARD_RQ_ID(evs[i])));
+          break;
+        }
+        case EF_EVENT_TYPE_RX_REF:
+          handleRxRef(res, evs[i].rx_ref.pkt_id, evs[i].rx_ref.len, out,
+                      &batchTs);
+          break;
+        case EF_EVENT_TYPE_RX_REF_DISCARD:
+          handleRxRef(res, evs[i].rx_ref_discard.pkt_id,
+                      evs[i].rx_ref_discard.len, out, &batchTs);
+          break;
+        case EF_EVENT_TYPE_RESET:
+          throw std::runtime_error("NIC reset: VI is no longer valid");
         default:
           throw std::runtime_error("ef_eventq_poll: unknown event type");
-          break;
         }
       }
-      // Refill the RX descriptor ring
-      if (ef_vi_receive_space(&res.vi) > refillBatchSize &&
-          res.freePktBufs.size() > refillBatchSize) {
-        for (int i = 0; i < refillBatchSize; ++i) {
-          const int pkt_buf_id =
-              res.freePktBufs[res.freePktBufs.size() - refillBatchSize + i];
-          ef_vi_receive_init(&res.vi, res.pktBufAddrs[pkt_buf_id], pkt_buf_id);
-        }
-        res.freePktBufs.resize(res.freePktBufs.size() - refillBatchSize);
-        ef_vi_receive_push(&res.vi);
-      }
+      refillRxRing(res);
     }
   }
 
-  if (pcapDumper) {
+  if (useWriter) {
+    if (writer.joinable()) {
+      writer.join();
+    }
+    if (droppedEnqueue.load() > 0) {
+      std::cerr << "warning: dropped " << droppedEnqueue.load()
+                << " packets because pcap queue was full" << std::endl;
+    }
     pcap_dump_close(pcapDumper);
     pcap_close(pcap);
   }

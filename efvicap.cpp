@@ -215,12 +215,34 @@ struct CaptureOutput {
   std::atomic<uint64_t> *droppedEnqueue;
 };
 
+struct RxRefGuard {
+  struct ef_vi *vi;
+  unsigned pktId;
+
+  ~RxRefGuard() { efct_vi_rxpkt_release(vi, pktId); }
+};
+
+static int clampCaptureLen(int bufLen) {
+  if (bufLen <= 0) {
+    return 0;
+  }
+  if (static_cast<size_t>(bufLen) > pktBufSize) {
+    return static_cast<int>(pktBufSize);
+  }
+  return bufLen;
+}
+
 static void deliverPacket(const char *buf, int bufLen, const void *hwPkt,
                           Resources &res, CaptureOutput &out,
                           const timespec *batchTs) {
+  const int captureLen = clampCaptureLen(bufLen);
+  if (captureLen == 0) {
+    return;
+  }
+
   if (out.useWriter) {
     PcapSlot slot = {};
-    slot.caplen = static_cast<uint32_t>(bufLen);
+    slot.caplen = static_cast<uint32_t>(captureLen);
     if (out.hwTimestamps) {
       timespec ts = {};
       unsigned flags = 0;
@@ -232,7 +254,7 @@ static void deliverPacket(const char *buf, int bufLen, const void *hwPkt,
     } else {
       slot.ts = timespecToTimeval(*batchTs);
     }
-    std::memcpy(slot.data, buf, static_cast<size_t>(bufLen));
+    std::memcpy(slot.data, buf, static_cast<size_t>(captureLen));
     if (!out.ring->try_push(slot)) {
       ++(*out.droppedEnqueue);
     }
@@ -241,7 +263,7 @@ static void deliverPacket(const char *buf, int bufLen, const void *hwPkt,
 
   if (out.pcapDumper) {
     pcap_pkthdr pktHdr = {};
-    pktHdr.caplen = static_cast<bpf_u_int32>(bufLen);
+    pktHdr.caplen = static_cast<bpf_u_int32>(captureLen);
     pktHdr.len = static_cast<bpf_u_int32>(bufLen);
     if (out.hwTimestamps) {
       timespec ts = {};
@@ -257,7 +279,7 @@ static void deliverPacket(const char *buf, int bufLen, const void *hwPkt,
     pcap_dump(reinterpret_cast<u_char *>(out.pcapDumper), &pktHdr,
               reinterpret_cast<const u_char *>(buf));
   } else {
-    printPacket(buf, bufLen);
+    printPacket(buf, captureLen);
   }
 }
 
@@ -272,10 +294,9 @@ static void handleRx(Resources &res, int pktBufId, int len, const void *hwPkt,
 static void handleRxRef(Resources &res, unsigned pktId, int len,
                         CaptureOutput &out, const timespec *batchTs) {
   const void *pkt = efct_vi_rxpkt_get(&res.vi, pktId);
-  const char *buf = static_cast<const char *>(pkt) + res.rxPrefixLen;
-  const int bufLen = len - res.rxPrefixLen;
-  deliverPacket(buf, bufLen, pkt, res, out, batchTs);
-  efct_vi_rxpkt_release(&res.vi, pktId);
+  RxRefGuard guard{&res.vi, pktId};
+  const char *buf = static_cast<const char *>(pkt);
+  deliverPacket(buf, len, pkt, res, out, batchTs);
 }
 
 static void writerThread(WriterContext *ctx) {

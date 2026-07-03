@@ -38,6 +38,7 @@ SOFTWARE.
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <memory>
 #include <pcap.h>
 #include <sys/mman.h>
 #include <system_error>
@@ -63,19 +64,26 @@ constexpr size_t hugePageSize = 2 * 1024 * 1024;
 
 struct PcapSlot {
   uint32_t caplen;
+  uint32_t len;
   struct timeval ts;
   uint8_t data[pktBufSize];
 };
 
 class SpscRing {
 public:
-  bool try_push(const PcapSlot &slot) {
+  bool try_push(const char *buf, int captureLen, int frameLen,
+                const struct timeval &ts) {
     const uint32_t tail = tail_.load(std::memory_order_relaxed);
     const uint32_t next = (tail + 1) & (pcapRingCapacity - 1);
     if (next == head_.load(std::memory_order_acquire)) {
       return false;
     }
-    slots_[tail] = slot;
+
+    PcapSlot &slot = slots_[tail];
+    slot.caplen = static_cast<uint32_t>(captureLen);
+    slot.len = static_cast<uint32_t>(frameLen);
+    slot.ts = ts;
+    std::memcpy(slot.data, buf, static_cast<size_t>(captureLen));
     tail_.store(next, std::memory_order_release);
     return true;
   }
@@ -101,12 +109,6 @@ private:
   alignas(64) std::atomic<uint32_t> tail_{0};
 };
 
-struct WriterContext {
-  SpscRing *ring;
-  pcap_dumper_t *dumper;
-  std::atomic<bool> *running;
-};
-
 struct PktBuf {
   int id;
   ef_addr efAddr;
@@ -126,6 +128,20 @@ struct Resources {
   int freePktBufsN;
   int refillLevel;
   int refillMin;
+};
+
+struct CaptureOutput {
+  bool hwTimestamps;
+  bool useWriter;
+  SpscRing *ring;
+  std::atomic<uint64_t> *droppedEnqueue;
+};
+
+struct RxRefGuard {
+  struct ef_vi *vi;
+  unsigned pktId;
+
+  ~RxRefGuard() { efct_vi_rxpkt_release(vi, pktId); }
 };
 
 static std::ostream &operator<<(std::ostream &os, const in_addr addr) {
@@ -164,20 +180,17 @@ static void printPacket(const void *buf, int /*len*/) {
   }
 }
 
-static void pktBufFree(Resources &res, PktBuf *pktBuf) {
+static void pktBufFreeById(Resources &res, int id) {
+  PktBuf *pktBuf = &res.pktBufPool[static_cast<size_t>(id)];
   pktBuf->next = res.freePktBufs;
   res.freePktBufs = pktBuf;
   ++res.freePktBufsN;
 }
 
-static PktBuf *pktBufFromId(Resources &res, int id) {
-  return &res.pktBufPool[static_cast<size_t>(id)];
-}
-
-static bool refillRxRing(Resources &res) {
+static void refillRxRing(Resources &res) {
   if (ef_vi_receive_fill_level(&res.vi) > res.refillLevel ||
       res.freePktBufsN < refillBatchSize) {
-    return false;
+    return;
   }
 
   do {
@@ -190,37 +203,29 @@ static bool refillRxRing(Resources &res) {
   } while (ef_vi_receive_fill_level(&res.vi) < res.refillMin &&
            res.freePktBufsN >= refillBatchSize);
   ef_vi_receive_push(&res.vi);
-  return true;
 }
 
-static struct timeval timespecToTimeval(const timespec &ts) {
+static struct timeval resolvePktTimestamp(Resources &res, const void *hwPkt,
+                                          const timespec *batchTs,
+                                          bool hwTimestamps) {
+  if (hwTimestamps) {
+    timespec ts = {};
+    unsigned flags = 0;
+    if (ef_vi_receive_get_timestamp_with_sync_flags(
+            &res.vi, hwPkt, &ts, &flags)) {
+      throw std::runtime_error("failed to get hw timestamp");
+    }
+    struct timeval tv = {};
+    tv.tv_sec = ts.tv_sec;
+    tv.tv_usec = static_cast<suseconds_t>(ts.tv_nsec);
+    return tv;
+  }
+
   struct timeval tv = {};
-  tv.tv_sec = ts.tv_sec;
-  tv.tv_usec = static_cast<suseconds_t>(ts.tv_nsec / 1000);
+  tv.tv_sec = batchTs->tv_sec;
+  tv.tv_usec = static_cast<suseconds_t>(batchTs->tv_nsec / 1000);
   return tv;
 }
-
-static struct timeval hwTimestampToTimeval(const timespec &ts) {
-  struct timeval tv = {};
-  tv.tv_sec = ts.tv_sec;
-  tv.tv_usec = static_cast<suseconds_t>(ts.tv_nsec);
-  return tv;
-}
-
-struct CaptureOutput {
-  bool hwTimestamps;
-  bool useWriter;
-  pcap_dumper_t *pcapDumper;
-  SpscRing *ring;
-  std::atomic<uint64_t> *droppedEnqueue;
-};
-
-struct RxRefGuard {
-  struct ef_vi *vi;
-  unsigned pktId;
-
-  ~RxRefGuard() { efct_vi_rxpkt_release(vi, pktId); }
-};
 
 static int clampCaptureLen(int bufLen) {
   if (bufLen <= 0) {
@@ -241,53 +246,22 @@ static void deliverPacket(const char *buf, int bufLen, const void *hwPkt,
   }
 
   if (out.useWriter) {
-    PcapSlot slot = {};
-    slot.caplen = static_cast<uint32_t>(captureLen);
-    if (out.hwTimestamps) {
-      timespec ts = {};
-      unsigned flags = 0;
-      if (ef_vi_receive_get_timestamp_with_sync_flags(
-              &res.vi, hwPkt, &ts, &flags)) {
-        throw std::runtime_error("failed to get hw timestamp");
-      }
-      slot.ts = hwTimestampToTimeval(ts);
-    } else {
-      slot.ts = timespecToTimeval(*batchTs);
-    }
-    std::memcpy(slot.data, buf, static_cast<size_t>(captureLen));
-    if (!out.ring->try_push(slot)) {
+    const struct timeval ts =
+        resolvePktTimestamp(res, hwPkt, batchTs, out.hwTimestamps);
+    if (!out.ring->try_push(buf, captureLen, bufLen, ts)) {
       ++(*out.droppedEnqueue);
     }
     return;
   }
 
-  if (out.pcapDumper) {
-    pcap_pkthdr pktHdr = {};
-    pktHdr.caplen = static_cast<bpf_u_int32>(captureLen);
-    pktHdr.len = static_cast<bpf_u_int32>(bufLen);
-    if (out.hwTimestamps) {
-      timespec ts = {};
-      unsigned flags = 0;
-      if (ef_vi_receive_get_timestamp_with_sync_flags(
-              &res.vi, hwPkt, &ts, &flags)) {
-        throw std::runtime_error("failed to get hw timestamp");
-      }
-      pktHdr.ts = hwTimestampToTimeval(ts);
-    } else {
-      pktHdr.ts = timespecToTimeval(*batchTs);
-    }
-    pcap_dump(reinterpret_cast<u_char *>(out.pcapDumper), &pktHdr,
-              reinterpret_cast<const u_char *>(buf));
-  } else {
-    printPacket(buf, captureLen);
-  }
+  printPacket(buf, captureLen);
 }
 
 static void handleRx(Resources &res, int pktBufId, int len, const void *hwPkt,
                      CaptureOutput &out, const timespec *batchTs) {
-  pktBufFree(res, pktBufFromId(res, pktBufId));
+  pktBufFreeById(res, pktBufId);
   const char *buf = static_cast<const char *>(res.pktBufs) +
-                      pktBufSize * pktBufId + res.rxPrefixLen;
+                    pktBufSize * pktBufId + res.rxPrefixLen;
   deliverPacket(buf, len, hwPkt, res, out, batchTs);
 }
 
@@ -295,23 +269,7 @@ static void handleRxRef(Resources &res, unsigned pktId, int len,
                         CaptureOutput &out, const timespec *batchTs) {
   const void *pkt = efct_vi_rxpkt_get(&res.vi, pktId);
   RxRefGuard guard{&res.vi, pktId};
-  const char *buf = static_cast<const char *>(pkt);
-  deliverPacket(buf, len, pkt, res, out, batchTs);
-}
-
-static void writerThread(WriterContext *ctx) {
-  PcapSlot slot;
-  while (ctx->running->load(std::memory_order_acquire) || !ctx->ring->empty()) {
-    if (ctx->ring->try_pop(slot)) {
-      pcap_pkthdr pktHdr = {};
-      pktHdr.ts = slot.ts;
-      pktHdr.caplen = slot.caplen;
-      pktHdr.len = slot.caplen;
-      pcap_dump(reinterpret_cast<u_char *>(ctx->dumper), &pktHdr, slot.data);
-    } else {
-      std::this_thread::yield();
-    }
-  }
+  deliverPacket(static_cast<const char *>(pkt), len, pkt, res, out, batchTs);
 }
 
 std::atomic<bool> active = {true};
@@ -418,7 +376,7 @@ int main(int argc, char *argv[]) {
     PktBuf &pktBuf = res.pktBufPool[static_cast<size_t>(i)];
     pktBuf.id = i;
     pktBuf.efAddr = ef_memreg_dma_addr(&res.memreg, i * pktBufSize);
-    pktBufFree(res, &pktBuf);
+    pktBufFreeById(res, i);
   }
 
   res.refillLevel = res.nPktBufs - refillBatchSize;
@@ -481,9 +439,8 @@ int main(int argc, char *argv[]) {
 
   pcap_t *pcap = nullptr;
   pcap_dumper_t *pcapDumper = nullptr;
-  SpscRing pcapRing;
+  auto pcapRing = std::make_unique<SpscRing>();
   std::thread writer;
-  WriterContext writerCtx = {};
   std::atomic<uint64_t> droppedEnqueue = {0};
   const bool useWriter = !filename.empty();
 
@@ -500,17 +457,27 @@ int main(int argc, char *argv[]) {
       throw std::runtime_error("pcap_dump_open: " +
                                std::string(pcap_geterr(pcap)));
     }
-    writerCtx.ring = &pcapRing;
-    writerCtx.dumper = pcapDumper;
-    writerCtx.running = &active;
-    writer = std::thread(writerThread, &writerCtx);
+    writer = std::thread([&]() {
+      PcapSlot slot;
+      while (active.load(std::memory_order_acquire) || !pcapRing->empty()) {
+        if (pcapRing->try_pop(slot)) {
+          pcap_pkthdr pktHdr = {};
+          pktHdr.ts = slot.ts;
+          pktHdr.caplen = slot.caplen;
+          pktHdr.len = slot.len;
+          pcap_dump(reinterpret_cast<u_char *>(pcapDumper), &pktHdr,
+                    slot.data);
+        } else {
+          std::this_thread::yield();
+        }
+      }
+    });
   }
 
   CaptureOutput out = {};
   out.hwTimestamps = hw_timestamps;
   out.useWriter = useWriter;
-  out.pcapDumper = pcapDumper;
-  out.ring = &pcapRing;
+  out.ring = pcapRing.get();
   out.droppedEnqueue = &droppedEnqueue;
 
   std::array<ef_event, 32> evs = {};
@@ -526,7 +493,7 @@ int main(int argc, char *argv[]) {
         switch (EF_EVENT_TYPE(evs[i])) {
         case EF_EVENT_TYPE_RX: {
           if (EF_EVENT_RX_SOP(evs[i]) == 0 || EF_EVENT_RX_CONT(evs[i]) != 0) {
-            pktBufFree(res, pktBufFromId(res, EF_EVENT_RX_RQ_ID(evs[i])));
+            pktBufFreeById(res, EF_EVENT_RX_RQ_ID(evs[i]));
             break;
           }
           const int pktBufId = EF_EVENT_RX_RQ_ID(evs[i]);
@@ -537,7 +504,7 @@ int main(int argc, char *argv[]) {
           break;
         }
         case EF_EVENT_TYPE_RX_DISCARD: {
-          pktBufFree(res, pktBufFromId(res, EF_EVENT_RX_DISCARD_RQ_ID(evs[i])));
+          pktBufFreeById(res, EF_EVENT_RX_DISCARD_RQ_ID(evs[i]));
           break;
         }
         case EF_EVENT_TYPE_RX_REF:

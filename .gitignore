@@ -3,3 +3,4 @@ build
 cmake-build-*/
 *~
 scripts/build_remote.sh
+efvicap
